@@ -9,5 +9,6 @@ class UserManager(YeeduClient):
         :return: API response JSON
         """
         # tenant_id is passed as a path parameter
-        endpoint = f"/user/associateTenant/{tenant_id}"
+        print(tenant_id)
+        endpoint = f"/user/select/{tenant_id}"
         return self._request("POST", endpoint)

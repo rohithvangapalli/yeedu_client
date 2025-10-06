@@ -12,10 +12,12 @@ class ObjectStorageManager(YeeduClient):
 
     def upload_file(self, file_path, osm_id=None, osm_name=None, overwrite=False, target_dir=None):
         file_size = os.path.getsize(file_path)
+        file_name = os.path.basename(file_path)
+        print(file_path)
         params = {
             "overwrite": str(overwrite).lower(),
             "is_dir": "false",
-            "path": os.path.basename(file_path)
+            "path": file_path
         }
         if osm_id: params["object_storage_manager_id"] = osm_id
         if osm_name: params["object_storage_manager_name"] = osm_name
