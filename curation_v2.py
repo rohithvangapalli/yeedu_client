@@ -1,0 +1,515 @@
+import base64
+import datetime
+import json
+import logging
+import os
+import sys
+import time
+import subprocess
+import requests
+from Crypto.Cipher import AES
+from jproperties import Properties
+
+from client.workspace_manager import WorkspaceManager
+from client.cluster_manager import ClusterManager
+from client.object_storage import ObjectStorageManager
+from client.jobs import JobsManager
+from client.user import UserManager
+
+
+def logging_bootstrap():
+    logging.basicConfig(format='[%(asctime)s] \t %(levelname)s:%(message)s', level=logging.DEBUG)
+    logging.info("[+] Logging nabu-sparkbot-curation Job")
+
+
+# -------------------- Helpers --------------------
+def get_var(varname, NABU_SPARK_BOT_HOME):
+    get_var_cmd = f'echo $(source {NABU_SPARK_BOT_HOME}/yeedu/conf/small/nabu_spark_conf.sh; echo ${varname})'
+    result = subprocess.Popen(get_var_cmd, stdout=subprocess.PIPE, shell=True, executable='/bin/bash', universal_newlines=True)
+    return result.stdout.readlines()[0].strip()
+
+
+def get_property_value(property_name, NABU_SPARK_BOT_HOME):
+    configs = Properties()
+    with open(f'{NABU_SPARK_BOT_HOME}/../common-lib/src/main/resources/nabu_common.properties', 'rb') as config_file:
+        configs.load(config_file)
+        return configs.get(property_name).data
+
+
+def extract_key_value_pairs(extra_conf_json):
+    config_map = extra_conf_json.get("extraConfigMap", {})
+    return [f"--conf={key}={value}" for key, value in config_map.items()]
+
+def AESDecryption(hex_str, NABU_SPARK_BOT_HOME):
+    encrypted = bytes.fromhex(hex_str)
+    key = open(f"{NABU_SPARK_BOT_HOME}/keys/aesKey", "rb").read()
+    cipher = AES.new(key, AES.MODE_ECB)
+    decrypted = cipher.decrypt(encrypted)
+    return decrypted.decode("utf-8").rstrip("\x00")
+
+
+def decode_credentials(b64_json, NABU_SPARK_BOT_HOME):
+    obj = json.loads(base64.b64decode(b64_json).decode("utf-8"))
+    credential_id = obj.get("credential_id", "")
+    credential_type_id = obj.get("credential_type_id", "")
+    token_hex = obj.get("token", "")
+    token = AESDecryption(token_hex, NABU_SPARK_BOT_HOME)
+    endpoint = obj.get("credential_endpoint_url")
+    return credential_id, credential_type_id, token, endpoint
+
+
+def getCredentials(b64_creds_json, NABU_SPARK_BOT_HOME):
+    try:
+        credential_id, credential_type_id, token, endpoint = decode_credentials(b64_creds_json, NABU_SPARK_BOT_HOME)
+        payload = json.dumps({"credential_id": credential_id, "credential_type_id": credential_type_id})
+        headers = {'Authorization': token, 'Accept': 'application/json', 'Content-Type': 'application/json'}
+        response = requests.post(endpoint, headers=headers, data=payload)
+        response_json = response.json()
+
+        if response.status_code != 200 or 'expired' in str(response_json.get("data")):
+            raise Exception(f"Credential error: {response.status_code}, {response_json.get('data')}")
+
+        return response_json['data']['tenant_id'], response_json['data']['token']
+    except Exception as e:
+        logging.error(f"[+] Exception: Error has occurred: {e}")
+        sys.exit(1)
+
+
+def getHiveCredentials(b64_hivecreds_json, NABU_SPARK_BOT_HOME):
+    try:
+        credential_id, credential_type_id, token, endpoint = decode_credentials(b64_hivecreds_json, NABU_SPARK_BOT_HOME)
+        payload = json.dumps({"credential_id": credential_id, "credential_type_id": credential_type_id})
+        headers = {'Authorization': token, 'Accept': 'application/json', 'Content-Type': 'application/json'}
+        response = requests.post(endpoint, headers=headers, data=payload)
+        response_json = response.json()
+
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch Hive credentials: {response.status_code}, {response_json}")
+
+        return response_json['data']['principal'], response_json['data']['keytab']
+    except Exception as e:
+        logging.error(f"[+] Exception: Error has occurred: {e}")
+        sys.exit(1)
+
+# -------------------- Upload Temporary Resources --------------------
+def upload_temp_resources(object_storage_mgr, osm_name, NABU_SPARK_BOT_HOME):
+    logging.info("[+] Uploading temporary resources")
+
+    temp_resources_list = [
+        f"{NABU_SPARK_BOT_HOME}/yeedu/conf/small/application.conf",
+        f"{NABU_SPARK_BOT_HOME}/keys/privateKey"
+    ]
+
+    for resource_path in temp_resources_list:
+        if not os.path.exists(resource_path):
+            logging.warning(f"File does not exist: {resource_path}")
+            continue
+
+        try:
+            print(f"Uploading temporary resource: {os.path.basename(resource_path)}")
+            response = object_storage_mgr.upload_file(
+                file_path=resource_path,
+                osm_name=osm_name,
+                overwrite=True
+            )
+            logging.info(f"[+] Uploaded temporary resource {resource_path}: {response}")
+        except Exception as e:
+            logging.error(f"Failed to upload {resource_path}: {e}")
+
+
+# -------------------- Upload JARs if Missing --------------------
+def reupload_selected_jars(object_storage_mgr, osm_name):
+    original_jars = [
+        # Add the required JAR paths here
+        # e.g., "/path/to/required-jar.jar"
+    ]
+
+    local_jar_map = {
+        # "required-jar.jar": "/local/path/to/required-jar.jar"
+    }
+
+    try:
+        existing_files_resp = object_storage_mgr.list_files(osm_name=osm_name)
+        existing_paths = [item["full_file_path"] for item in existing_files_resp.get("data", [])]
+        print("Existing files in object storage:")
+        print(existing_paths)
+    except Exception as e:
+        logging.error(f"Failed to fetch file list from OSM: {e}")
+        return
+
+    for jar_uri in original_jars:
+        jar_name = os.path.basename(jar_uri)
+        if jar_uri not in existing_paths:
+            local_path = local_jar_map.get(jar_name)
+            if not local_path or not os.path.exists(local_path):
+                logging.warning(f"Local JAR not found for {jar_name}: {local_path}")
+                continue
+
+            try:
+                print(f"Uploading missing jar: {jar_name}")
+                response = object_storage_mgr.upload_file(
+                    file_path=local_path,
+                    osm_name=osm_name,
+                    overwrite=True
+                )
+                print(f"Uploaded {jar_name}: {response}")
+            except Exception as e:
+                logging.error(f"Failed to upload {jar_name}: {e}")
+        else:
+            print(f"{jar_name} already exists in object storage, skipping.")
+
+# -------------------- Job Creation --------------------
+def create_job_new_style(jobs_client):
+    external = json.loads(base64.b64decode(b64_external_jars_map).decode("utf-8"))
+    jars_list = []
+    if external.get("external_jars"):
+        ext_list = external.get("external_jars_list", [])
+        jars_list = [f"/yeedu/object-storage-manager/{j}" for j in ext_list]
+
+    # Required JARs
+    required = [
+        f"/yeedu/object-storage-manager/hadoop-aws-{hadoop_version}.jar",
+        f"/yeedu/object-storage-manager/{NABU_SPARK_BOT_REFLECTION_3_2_JAR}"
+    ]
+    jars_list.extend(required)
+
+    # File format detection
+    fmt = json.loads(base64.b64decode(b64_file_format_json).decode("utf-8"))
+    isIceberg = fmt.get("isIcebergeEnabled", False)
+    isDelta = fmt.get("isDeltaEnabled", False)
+
+    # Spark Configs
+    driver_memory = executor_memory = driver_cores = executor_cores = num_executors = total_executor_cores = None
+    principal = keytab = None
+
+    if cluster_ui in ("STANDALONE", "CLUSTER"):
+        spark_cfg = {}
+        if input_args_json.get("spark_configs"):
+            spark_cfg = json.loads(base64.b64decode(input_args_json["spark_configs"]).decode("utf-8"))
+            driver_memory = spark_cfg.get("driver_memory")
+            executor_memory = spark_cfg.get("executor_memory")
+            driver_cores = spark_cfg.get("driver_cores")
+            executor_cores = spark_cfg.get("executor_cores")
+            num_executors = spark_cfg.get("num_executors")
+            total_executor_cores = spark_cfg.get("total_executor_cores")
+    elif cluster_ui == "YEEDU" and cluster_hive_enable not in (None, "None"):
+        hive_b64 = input_args_json.get("b64_hive_creds_json")
+        if hive_b64:
+            principal, keytab = getHiveCredentials(hive_b64, NABU_SPARK_BOT_HOME)
+
+    conf_list = [
+        "spark.ui.enabled=false",
+        "spark.ui.retainedTasks=100",
+        "spark.driver.maxResultSize=1G",
+        "spark.sql.crossJoin.enabled=true",
+        "spark.ui.retainedStages=100",
+        "spark.ui.retainedJobs=100",
+        "spark.yarn.maxAppAttempts=1",
+        "spark.executor.heartbeatInterval=60s",
+        "spark.network.timeout=500s",
+        "spark.sql.parquet.page.size.row.check.min=20",
+        "spark.hadoop.fs.s3a.fast.upload=true",
+        "spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version=2",
+        "spark.dynamicAllocation.enabled=true",
+        "spark.dynamicAllocation.shuffleTracking.enabled=true",
+        "spark.dynamicAllocation.minExecutors=1",
+        "spark.hadoop.fs.s3a.bucket.all.committer.magic.enabled=true",
+        "spark.driver.nabu_privateKey=/yeedu/object-storage-manager/privateKey",
+        "spark.driver.extraClassPath=/yeedu/object-storage-manager/",
+        f"spark.driver.nabu_fireshots_url={NABU_FIRESHOTS_URL}",
+    ]
+
+    if driver_memory:
+        conf_list.append(f"spark.driver.memory={driver_memory}")
+    if executor_memory:
+        conf_list.append(f"spark.executor.memory={executor_memory}")
+    if driver_cores:
+        conf_list.append(f"spark.driver.cores={driver_cores}")
+    if executor_cores:
+        conf_list.append(f"spark.executor.cores={executor_cores}")
+    if num_executors:
+        conf_list.append(f"spark.executor.instances={num_executors}")
+
+    if isDelta:
+        conf_list.append("spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension")
+        conf_list.append("spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    if isIceberg:
+        conf_list.append("spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        conf_list.append("spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog")
+
+    if principal and keytab:
+        conf_list.append(f"spark.hadoop.hive.metastore.kerberos.principal={principal}")
+        conf_list.append(f"spark.hadoop.hive.metastore.kerberos.keytab.file={keytab}")
+
+    # Build files
+    files_list = ["/yeedu/object-storage-manager/application.conf"]
+    if keytab:
+        files_list.append(keytab)
+
+    # Driver options
+    timestamp = str(int(datetime.datetime.now().timestamp()))
+    if cluster_ui in ("STANDALONE", "CLUSTER"):
+        driver_java_options = (
+            f"-Dderby.system.home=/yeedu/spark_metastores/{timestamp}-{batch_id} "
+            f"-Djava.library.path=/usr/local/lib/python{python_version}/dist-packages/jep/"
+        )
+    else:
+        driver_java_options = f"-Djava.library.path=/usr/local/lib/python{python_version}/dist-packages/jep/"
+
+    job_data_dict = {
+        "name": f"spark_curation_job_{batch_id}_{retry_num}_{process_id}",
+        "cluster_id": cluster_id,
+        "max_concurrency": 100,
+        "job_class_name": "com.modak.BootstrapCuration",
+        "job_command": f"file:///yeedu/object-storage-manager/{NABU_SPARK_BOT_REFLECTION_3_2_JAR}",
+        "job_arguments": b64_input_json,
+        "job_rawScalaCode": None,
+        "job_type": "Jar",
+        "job_timeout_min": None,
+        "files": files_list,
+        "properties_file": [],
+        "conf": conf_list,
+        "packages": [],
+        "repositories": [],
+        "jars": jars_list,
+        "archives": [],
+        "driver_memory": driver_memory,
+        "driver_java_options": driver_java_options,
+        "driver_library_path": None,
+        "driver_class_path": "/yeedu/object-storage-manager/",
+        "executor_memory": executor_memory,
+        "driver_cores": driver_cores,
+        "total_executor_cores": total_executor_cores,
+        "executor_cores": executor_cores,
+        "num_executors": num_executors,
+        "principal": principal,
+        "keytab": keytab,
+        "queue": None,
+        "should_append_params": False
+    }
+
+    resp = jobs_client.create_job(job_data_dict)
+    return resp.get("job_id")
+
+# -------------------- Job Monitoring --------------------
+def monitor_job(jobs, run_id):
+    while True:
+        status = jobs.get_job_status(run_id)
+        print("Status:", status)
+        active = next((s for s in status if s.get("end_time") == "infinity"), None)
+        if not active:
+            print("Job complete.")
+            break
+        state = active.get("run_status")
+        print("Current state:", state)
+        if state in ("DONE", "SUCCESS", "FAILED", "ERROR"):
+            print("Final state:", state)
+            break
+        time.sleep(5)
+
+
+# -------------------- Main Execution --------------------
+if __name__ == "__main__":
+    logging_bootstrap()
+
+    NABU_SPARK_BOT_HOME = sys.argv[1]
+    b64_input_args_json = sys.argv[2]
+    b64_file_format_json = sys.argv[3]
+
+    decoded_input_args_json = base64.b64decode(b64_input_args_json).decode("utf-8")
+    input_args_json = json.loads(decoded_input_args_json)
+    b64_input_json = input_args_json['b64_input_json']
+    decoded_input_json = base64.b64decode(b64_input_json).decode("utf-8")
+    input_json = json.loads(decoded_input_json)
+
+    cluster_name = input_args_json['cluster_name']
+    workspace_name = input_args_json['workspace_name']
+    process_id = input_args_json['process_id']
+    batch_id = input_args_json['batch_id']
+    retry_num = input_args_json['retry_num']
+    cluster_ui = input_args_json['cluster_ui']
+    b64_external_jars_map = input_args_json['b64_external_jars_map']
+    b64_compute_eng_creds_json = input_args_json['compute_eng_creds_json']
+    b64_extra_config = input_args_json['extra_config']
+    decoded_extra_config_json = base64.b64decode(b64_extra_config).decode("utf-8")
+    extra_conf_json = json.loads(decoded_extra_config_json)
+    OSM_NAME = "sample"
+
+    logging.info(f"[+] Process ID: {process_id}, Batch ID: {batch_id}")
+
+    # Extract runtime values
+    NABU_FIRESHOTS_URL = get_var('NABU_FIRESHOTS_URL', NABU_SPARK_BOT_HOME)
+    NABU_SPARK_BOT_REFLECTION_3_2_JAR = get_var('NABU_SPARK_BOT_REFLECTION_3_2_JAR', NABU_SPARK_BOT_HOME)
+
+    # Get credentials (example placeholder)
+    TENANT_ID,TOKEN = getCredentials(b64_compute_eng_creds_json, NABU_SPARK_BOT_HOME)
+
+    BASE_URL = input_args_json['rest_url']
+
+
+    # Initialize clients
+    user_mgr = UserManager(BASE_URL, TOKEN)
+    osm = ObjectStorageManager(BASE_URL, TOKEN)
+    jobs = JobsManager(BASE_URL, TOKEN)
+    cluster_mgr = ClusterManager(BASE_URL, TOKEN)
+    workspace_mgr = WorkspaceManager(BASE_URL, TOKEN)
+
+
+    # -------------------- Associate Tenant --------------------
+    associate_resp = user_mgr.associate_tenant(tenant_id=TENANT_ID)
+    print("Tenant associated:", associate_resp)
+
+    # -------------------- Fetch Workspace & Cluster Info --------------------
+    workspace_resp = workspace_mgr.get_workspace(workspace_name=workspace_name)
+    workspace_id = workspace_resp.get("workspace_id") if workspace_resp else None
+    print("Workspace ID:", workspace_id)
+    cluster_resp = cluster_mgr.get_cluster(cluster_name=cluster_name)
+    cluster_id = cluster_resp.get("cluster_id")
+    cluster_type = cluster_resp.get("cluster_type")
+    cluster_ui = cluster_resp.get("cluster_ui")
+    cluster_conf = cluster_resp.get("cluster_conf", {})
+    cluster_hive_enable = cluster_conf.get("enable_hive")
+    hadoop_version = cluster_resp.get("spark_infra_version", {}).get("hadoop_version")
+    python_version = cluster_resp.get("spark_infra_version", {}).get("python_version")
+
+    print("Cluster Info:", cluster_id, cluster_type, cluster_ui, cluster_hive_enable, hadoop_version, python_version)
+
+    upload_temp_resources(osm, osm_name="aws_nabu_osm", NABU_SPARK_BOT_HOME=NABU_SPARK_BOT_HOME)
+    reupload_selected_jars(osm, osm_name=OSM_NAME)
+
+    # Create the job and get the job ID
+    job_id = create_job_new_style(jobs)
+
+    logging.info(f"Job submitted with ID: {job_id}")
+
+    # Monitor the job status until done
+    monitor_job(jobs, job_id)
+
+    logging.info("Job execution finished.")
+
+
+    def create_job_new_style1(
+            jobs_client
+    ):
+        external = json.loads(base64.b64decode(b64_external_jars_map).decode("utf-8"))
+        jars_list = []
+        if external.get("external_jars"):
+            ext_list = external.get("external_jars_list", [])
+            jars_list = [f"/yeedu/object-storage-manager/{j}" for j in ext_list]
+
+        # Required JARs - add as needed
+        required = [
+            f"/yeedu/object-storage-manager/hadoop-aws-{hadoop_version}.jar",
+            f"/yeedu/object-storage-manager/{NABU_SPARK_BOT_REFLECTION_3_2_JAR}"
+        ]
+        jars_list.extend(required)
+
+        fmt = json.loads(base64.b64decode(b64_file_format_json).decode("utf-8"))
+        isIceberg = fmt.get("isIcebergeEnabled", False)
+        isDelta = fmt.get("isDeltaEnabled", False)
+
+        spark_cfg = {}
+        if input_args_json.get("spark_configs"):
+            spark_cfg = json.loads(base64.b64decode(input_args_json["spark_configs"]).decode("utf-8"))
+
+        driver_memory = spark_cfg.get("driver_memory", None)
+        executor_memory = spark_cfg.get("executor_memory", None)
+        driver_cores = spark_cfg.get("driver_cores", None)
+        executor_cores = spark_cfg.get("executor_cores", None)
+        num_executors = spark_cfg.get("num_executors", None)
+        total_executor_cores = spark_cfg.get("total_executor_cores", None)
+
+        principal = None
+        keytab = None
+        if cluster_ui == "YEEDU" and cluster_hive_enable not in (None, "None"):
+            hive_b64 = input_args_json.get("b64_hive_creds_json")
+            if hive_b64:
+                principal, keytab = getHiveCredentials(hive_b64, NABU_SPARK_BOT_HOME)
+
+        conf_list = [
+            "spark.ui.enabled=false",
+            "spark.ui.retainedTasks=100",
+            "spark.driver.maxResultSize=1G",
+            "spark.sql.crossJoin.enabled=true",
+            "spark.ui.retainedStages=100",
+            "spark.ui.retainedJobs=100",
+            "spark.yarn.maxAppAttempts=1",
+            "spark.executor.heartbeatInterval=60s",
+            "spark.network.timeout=500s",
+            "spark.sql.parquet.page.size.row.check.min=20",
+            "spark.hadoop.fs.s3a.fast.upload=true",
+            "spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version=2",
+            "spark.dynamicAllocation.enabled=true",
+            "spark.dynamicAllocation.shuffleTracking.enabled=true",
+            "spark.dynamicAllocation.minExecutors=1",
+            "spark.hadoop.fs.s3a.bucket.all.committer.magic.enabled=true",
+            "spark.driver.nabu_privateKey=/yeedu/object-storage-manager/privateKey",
+            "spark.driver.extraClassPath=/yeedu/object-storage-manager/",
+            f"spark.driver.nabu_fireshots_url={NABU_FIRESHOTS_URL}",
+        ]
+
+        if driver_memory:
+            conf_list.append(f"spark.driver.memory={driver_memory}")
+        if executor_memory:
+            conf_list.append(f"spark.executor.memory={executor_memory}")
+        if driver_cores:
+            conf_list.append(f"spark.driver.cores={driver_cores}")
+        if executor_cores:
+            conf_list.append(f"spark.executor.cores={executor_cores}")
+        if num_executors:
+            conf_list.append(f"spark.executor.instances={num_executors}")
+
+        if isDelta:
+            conf_list.append("spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension")
+            conf_list.append("spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        if isIceberg:
+            conf_list.append("spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+            conf_list.append("spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog")
+
+        if principal and keytab:
+            conf_list.append(f"spark.hadoop.hive.metastore.kerberos.principal={principal}")
+            conf_list.append(f"spark.hadoop.hive.metastore.kerberos.keytab.file={keytab}")
+
+        # Build files
+        files_list = ["/yeedu/object-storage-manager/application.conf"]
+        if keytab:
+            files_list.append(keytab)
+
+        job_arguments = b64_input_json
+
+        driver_java_options = f"-Djava.library.path=/usr/local/lib/python{python_version}/dist-packages/jep/"
+
+        job_data_dict = {
+            "name": f"spark_curation_job_{batch_id}_{retry_num}_{process_id}",
+            "cluster_id": cluster_id,
+            "max_concurrency": 100,
+            "job_class_name": "com.modak.BootstrapCuration",
+            "job_command": f"file:///yeedu/object-storage-manager/{NABU_SPARK_BOT_REFLECTION_3_2_JAR}",
+            "job_arguments": job_arguments,
+            "job_rawScalaCode": None,
+            "job_type": "Jar",
+            "job_timeout_min": None,
+            "files": files_list,
+            "properties_file": [],
+            "conf": conf_list,
+            "packages": [],
+            "repositories": [],
+            "jars": jars_list,
+            "archives": [],
+            "driver_memory": driver_memory,
+            "driver_java_options": driver_java_options,
+            "driver_library_path": None,
+            "driver_class_path": "/yeedu/object-storage-manager/",
+            "executor_memory": executor_memory,
+            "driver_cores": driver_cores,
+            "total_executor_cores": total_executor_cores,
+            "executor_cores": executor_cores,
+            "num_executors": num_executors,
+            "principal": principal,
+            "keytab": keytab,
+            "queue": None,
+            "should_append_params": False
+        }
+
+        resp = jobs_client.create_job(job_data_dict)
+        return resp.get("job_id")
