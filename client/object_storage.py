@@ -5,26 +5,32 @@ from .base import YeeduClient
 class ObjectStorageManager(YeeduClient):
 
     def list_files(self, osm_id=None, osm_name=None, limit=100, page=1):
-        params = {"limit": limit, "pageNumber": page}
+        #params = {"limit": limit, "pageNumber": page}
+        params = {}
         if osm_id: params["object_storage_manager_id"] = osm_id
         if osm_name: params["object_storage_manager_name"] = osm_name
         return self._request("GET", "/object_storage_manager/files", params=params)
 
-    def upload_file(self, file_path, osm_id=None, osm_name=None, overwrite=False, target_dir=None):
+
+    def upload_file(self, file_path, osm_id=None, osm_name=None, overwrite=False, target_dir="//"):
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
-        print(file_path)
+
         params = {
             "overwrite": str(overwrite).lower(),
             "is_dir": "false",
-            "path": file_path
+            "path": f"/{file_name}",
+            "target_dir": target_dir
         }
-        if osm_id: params["object_storage_manager_id"] = osm_id
-        if osm_name: params["object_storage_manager_name"] = osm_name
-        if target_dir: params["target_dir"] = target_dir
+
+        if osm_id:
+            params["object_storage_manager_id"] = osm_id
+        if osm_name:
+            params["object_storage_manager_name"] = osm_name
 
         headers = self.headers.copy()
         headers["x-file-size"] = str(file_size)
+        headers["Content-Type"] = "application/octet-stream"
 
         with open(file_path, "rb") as f:
             resp = requests.post(
@@ -33,6 +39,7 @@ class ObjectStorageManager(YeeduClient):
                 params=params,
                 data=f
             )
+
         if not resp.ok:
             raise Exception(f"Upload failed: {resp.status_code} {resp.text}")
         return resp.json()
