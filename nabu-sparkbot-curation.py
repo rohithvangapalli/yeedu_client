@@ -8,7 +8,9 @@ import datetime
 import requests
 import subprocess
 from Crypto.Cipher import AES
+import psycopg2
 from jproperties import Properties
+from stringtemplate3 import StringTemplateGroup
 
 from client.workspace_manager import WorkspaceManager
 from client.cluster_manager import ClusterManager
@@ -16,6 +18,7 @@ from client.object_storage import ObjectStorageManager
 from client.jobs import JobsManager
 from client.user import UserManager
 
+group = StringTemplateGroup(fileName="queries.stg")
 
 def logging_bootstrap():
     try:
@@ -41,6 +44,41 @@ def api_call_with_retry(func, *args, **kwargs):
                 logging.error("Max retries reached, exiting.")
                 sys.exit(1)
 
+
+
+def render_sql(template_name, context):
+    st = group.getInstanceOf(template_name)
+    st["input_data"] = context["input_data"]
+    return st.toString()
+
+
+def execute_sql(sql):
+    conn = psycopg2.connect(
+        host=POSTGRES_HOST,
+        database=POSTGRES_DB,
+        user=POSTGRES_USERNAME,
+        password=POSTGRES_PASSWORD
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        result = cur.fetchall()
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in result]
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+def to_b64_json(obj):
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except json.JSONDecodeError:
+            pass
+
+    return base64.b64encode(json.dumps(obj).encode()).decode()
 
 def execute_cmd(cmd):
     current_retry = 0
@@ -636,12 +674,79 @@ def monitor_job(jobs_client):
 
 if __name__ == "__main__":
     logging_bootstrap()
-    NABU_SPARK_BOT_HOME = sys.argv[1]
-    b64_input_args_json = sys.argv[2]
-    b64_file_format_json = sys.argv[3]
-    bytes_string = base64.b64decode(b64_input_args_json)
-    decoded_input_args_json = bytes_string.decode("utf-8")
-    input_args_json = json.loads(decoded_input_args_json)
+    template_data_str = sys.argv[1]
+    b64_file_format_json = sys.argv[2]
+    template_data = json.loads(template_data_str)
+    query_results = {}
+    sql_templates = ["spark_home_path", "get_spark_configs", "fetching_script_inputs", "fetching_credential_inputs", "workspace_pipeline_json"]
+
+    for name in sql_templates:
+        print(f"\n--- Executing: {name} ---")
+        rendered_sql = render_sql(name, template_data)
+        print("SQL:\n", rendered_sql)
+        try:
+            result = execute_sql(rendered_sql)
+            query_results[name] = result
+        except Exception as e:
+            print(f"Error executing {name}: {e}")
+            query_results[name] = []
+            sys.exit(1)
+
+    input_data = template_data["input_data"]
+    data_movement_id =input_data["data_movement_id"]
+    spark_home_path = query_results.get("spark_home_path", [{}])[0]
+    NABU_SPARK_BOT_HOME = spark_home_path.get("spark_location", "")
+    config_row = query_results.get("get_spark_configs", [{}])[0]
+    script_input = query_results.get("fetching_script_inputs", [{}])[0]
+
+    cred_row = query_results.get("fetching_credential_inputs", [{}])[0]
+    compute_eng_creds_json = {
+        "credential_id": cred_row.get("spark_credential_id", ""),
+        "credential_type_id": cred_row.get("credential_type_id", ""),
+        "credential_type": cred_row.get("credential_type", ""),
+        "token": input_data["jwt_token"],
+        "credential_endpoint_url": input_data["end_point"],
+        "credential_file_pattern": cred_row.get("credential_pattern", "")
+    }
+
+    metastore_cred = {
+    "credential_id": cred_row.get("metastore_credential_id", ""),
+    "credential_type_id": cred_row.get("metastore_credential_type_id", ""),
+    "token": compute_eng_creds_json["token"],
+    "credential_endpoint_url": compute_eng_creds_json["credential_endpoint_url"]
+    }
+
+    input_args_json = {
+    "cluster_name": config_row.get("cluster_id", "default_cluster_name"),
+    "workspace_name": script_input.get("workspace_name", ""),
+    "b64_input_json": to_b64_json({
+        "processId": input_data["process_id"],
+        "dataplaceId": input_data["dataplace_id"],
+        "tableId": input_data["table_id"],
+        "datamovementId": input_data["data_movement_id"],
+        "jobScheduledUserId": input_data["job_scheduled_user_id"],
+        "jobScheduleId": input_data["job_schedule_id"],
+        "batchId": input_data["batch_id"],
+        "lastRunTimestamp": input_data.get("last_run_timestamp", ""),
+        "retryNum": str(input_data.get("retry_attempt", 0))
+    }),
+    "extra_config": to_b64_json({
+        "extraConfigMap": config_row.get("extra_configs_json", {})
+    }),
+    "compute_eng_creds_json": to_b64_json(compute_eng_creds_json),
+    "cluster_ui": script_input.get("cluster_ui", ""),
+    "retry_num": template_data["input_data"]["retry_attempt"],
+    "spark_configs": to_b64_json(config_row.get("spark_configs_json", {})),
+    "b64_hive_creds_json": to_b64_json(metastore_cred),
+    "batch_id": template_data["input_data"]["batch_id"],
+    "process_id": template_data["input_data"]["process_id"],
+    "rest_url": script_input.get("rest_url", ""),
+    "b64_external_jars_map": to_b64_json(script_input.get("b64_external_jars_map", {}))
+    }
+
+    print("\n✅ Final yeedu_input_json:")
+    print(json.dumps(input_args_json, indent=2))
+
     cluster_name = input_args_json['cluster_name']
     workspace_name = input_args_json['workspace_name']
     b64_input_json = input_args_json['b64_input_json']
@@ -666,6 +771,10 @@ if __name__ == "__main__":
     logging.info(key_value_pairs)
     NABU_FIRESHOTS_URL = get_var('NABU_FIRESHOTS_URL', NABU_SPARK_BOT_HOME)
     NABU_SPARK_BOT_REFLECTION_3_2_JAR = get_var('NABU_SPARK_BOT_REFLECTION_3_2_JAR', NABU_SPARK_BOT_HOME)
+    POSTGRES_USERNAME = get_property_value('NABU_KOSH_SERVICE_ACCOUNT_ROLE', NABU_SPARK_BOT_HOME)
+    POSTGRES_PASSWORD = get_property_value('NABU_KOSH_SERVICE_ACCOUNT_PASS', NABU_SPARK_BOT_HOME)
+    POSTGRES_HOST = get_property_value('NABU_KOSH_SERVICE_ENDPOINT', NABU_SPARK_BOT_HOME)
+    POSTGRES_DB = get_property_value('NABU_KOSH_SERVICE_DATABASE', NABU_SPARK_BOT_HOME)
     TENANT_ID, TOKEN = getCredentials(b64_compute_eng_creds_json, NABU_SPARK_BOT_HOME)
 
     user_mgr = api_call_with_retry(UserManager, BASE_URL, TOKEN)
