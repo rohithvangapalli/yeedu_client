@@ -1,0 +1,103 @@
+group sql_templates;
+
+spark_home_path(input_data)::=<<
+SELECT CASE WHEN b.compute_engine_info ->\> 'nabu_external_path' IS NULL THEN '/opt/nabu/'
+    ELSE b.compute_engine_info->\>'nabu_external_path'
+  END AS spark_location
+FROM nabu.data_movement_physical a
+INNER JOIN nabu.compute_engine b ON a.compute_engine_id = b.compute_engine_id
+INNER JOIN nabu.config c ON b.compute_engine_config_id = c.config_id
+WHERE a.data_movement_id = <input_data.data_movement_id>
+  AND a.valid_to_ts = '9999-12-31 00:00:00.000'
+  AND b.valid_to_ts = '9999-12-31 00:00:00.000';
+>>
+
+workspace_pipeline_json(input_data)::=<<
+select * from nabu.workspace_pipeline where workspace_pipeline_id = <input_data.data_movement_id>
+>>
+
+get_spark_configs(input_data)::=<<
+WITH get_compute_engine_id AS (
+  SELECT compute_engine_id, <input_data.retry_attempt> AS retry_attempt,
+  (((wp.workspace_pipeline_json ->\>'pipelineJson')::json ->\> 'pipeline_config')::json ->\> 'flow_details')::json->\>'enable_spark_config' AS enable_spark_config_flag,
+  ((((wp.workspace_pipeline_json ->\>'pipelineJson')::json ->\> 'pipeline_config')::json ->\> 'flow_details')::json->\>'spark_config')::json AS spark_config
+  FROM nabu.workspace_pipeline wp
+  WHERE workspace_pipeline_id = <input_data.data_movement_id> AND is_deleted = false
+),
+get_max_priority_number AS (
+  SELECT cescd.compute_engine_id, MAX(spark_configuration_priority_number) AS max_priority_number
+  FROM nabu.compute_engine_spark_config_details cescd
+  INNER JOIN get_compute_engine_id gcei ON cescd.compute_engine_id = gcei.compute_engine_id
+  WHERE valid_to_ts = '9999-12-31 00:00:00.000'
+  GROUP BY cescd.compute_engine_id
+),
+get_priority_number AS (
+  SELECT gmpn.compute_engine_id, gcei.enable_spark_config_flag, gcei.spark_config,
+  CASE WHEN gmpn.max_priority_number > gcei.retry_attempt THEN gcei.retry_attempt+1 ELSE gmpn.max_priority_number END AS priority_number
+  FROM get_max_priority_number gmpn, get_compute_engine_id gcei
+),
+extra_configs AS (
+  SELECT
+    (cescd.spark_configuration_priority_json->\>'default_configs')::json->\>'cluster_name' AS cluster_id,
+    (cescd.spark_configuration_priority_json->\>'default_configs')::json->\>'fetch_size' AS fetch_size,
+    (cescd.spark_configuration_priority_json->\>'default_configs')::json->\>'solr_batch_size' AS solr_batch_size,
+    CASE
+      WHEN gpn.enable_spark_config_flag = 'true' THEN gpn.spark_config
+      ELSE (cescd.spark_configuration_priority_json->\>'default_configs')::json
+    END AS spark_configs_json,
+    cescd.spark_configuration_priority_json->\>'extra_configs' AS extra_configs
+  FROM nabu.compute_engine_spark_config_details cescd
+  INNER JOIN get_priority_number gpn ON cescd.compute_engine_id = gpn.compute_engine_id
+    AND cescd.spark_configuration_priority_number = gpn.priority_number
+  WHERE cescd.valid_to_ts = '9999-12-31 00:00:00.000'
+)
+SELECT
+  ec.spark_configs_json,
+  ec.cluster_id,
+  (CONCAT(
+    '{"spark.nabu.fetch_size": "', fetch_size,
+    '", "spark.nabu.solr_batch_size": "', solr_batch_size, '"}'
+  )::jsonb || extra_configs::jsonb)::json AS extra_configs_json
+FROM extra_configs ec;
+>>
+
+fetching_script_inputs(input_data)::=<<
+SELECT
+    b.compute_engine_info->\>'workspace_name' AS workspace_name,
+    b.compute_engine_info->\>'cluster_type' AS cluster_ui,
+    b.compute_engine_info->\>'yeedu_rest_url' AS rest_url,
+    b.additional_info->\>'external_jars_map' AS b64_external_jars_map
+FROM nabu.data_movement_physical a
+INNER JOIN nabu.compute_engine b ON a.compute_engine_id = b.compute_engine_id
+WHERE a.data_movement_id = <input_data.data_movement_id>
+  AND a.valid_to_ts = '9999-12-31 00:00:00.000'
+  AND b.valid_to_ts = '9999-12-31 00:00:00.000';
+>>
+
+fetching_credential_inputs(input_data)::=<<
+WITH fetch_ssh_configuration AS (
+  SELECT
+    b.credential_id AS spark_credential_id,
+    (b.additional_info->\>'hive_credential_id')::int AS metastore_credential_id
+  FROM nabu.data_movement_physical a
+  INNER JOIN nabu.compute_engine b ON a.compute_engine_id = b.compute_engine_id
+  INNER JOIN nabu.config c ON b.compute_engine_config_id = c.config_id
+  WHERE a.data_movement_id = <input_data.data_movement_id>
+    AND a.valid_to_ts = '9999-12-31'
+    AND b.valid_to_ts = '9999-12-31'
+)
+SELECT
+  fsc.spark_credential_id,
+  fsc.metastore_credential_id,
+  ci.credential_type_id,
+  ctl.credential_type,
+  fsc.spark_credential_id || '_' || extract(epoch FROM mod_ts::timestamp(0)) AS credential_pattern,
+  (
+    SELECT credential_type_id
+    FROM nabu.credential_info ci2
+    WHERE ci2.credential_id = fsc.metastore_credential_id
+  ) AS metastore_credential_type_id
+FROM fetch_ssh_configuration fsc
+INNER JOIN nabu.credential_info ci ON fsc.spark_credential_id = ci.credential_id
+INNER JOIN nabu.credential_type_lookup ctl ON ci.credential_type_id = ctl.credential_type_id;
+>>
