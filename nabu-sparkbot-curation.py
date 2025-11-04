@@ -678,7 +678,7 @@ if __name__ == "__main__":
     b64_file_format_json = sys.argv[2]
     template_data = json.loads(template_data_str)
     query_results = {}
-    sql_templates = ["spark_home_path", "get_spark_configs", "fetching_script_inputs", "fetching_credential_inputs", "workspace_pipeline_json"]
+    sql_templates = ["spark_home_path", "get_spark_configs", "fetching_script_inputs", "fetching_credential_inputs", "workspace_pipeline_json", "fetch_job_schedule_details"]
 
     for name in sql_templates:
         print(f"\n--- Executing: {name} ---")
@@ -698,6 +698,9 @@ if __name__ == "__main__":
     NABU_SPARK_BOT_HOME = spark_home_path.get("spark_location", "")
     config_row = query_results.get("get_spark_configs", [{}])[0]
     script_input = query_results.get("fetching_script_inputs", [{}])[0]
+    job_schedule_row = query_results.get("fetch_job_schedule_details", [{}])[0]
+    job_schedule_id = job_schedule_row.get("job_schedule_id")
+    job_schedule_name = job_schedule_row.get("cru_by")
 
     cred_row = query_results.get("fetching_credential_inputs", [{}])[0]
     compute_eng_creds_json = {
@@ -724,8 +727,8 @@ if __name__ == "__main__":
         "dataplaceId": input_data["dataplace_id"],
         "tableId": input_data["table_id"],
         "datamovementId": input_data["data_movement_id"],
-        "jobScheduledUserId": input_data["job_scheduled_user_id"],
-        "jobScheduleId": input_data["job_schedule_id"],
+        "jobScheduledUserId": job_schedule_name,
+        "jobScheduleId": job_schedule_id,
         "batchId": input_data["batch_id"],
         "lastRunTimestamp": input_data.get("last_run_timestamp", ""),
         "retryNum": str(input_data.get("retry_attempt", 0))
