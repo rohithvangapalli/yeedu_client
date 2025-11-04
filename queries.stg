@@ -17,10 +17,10 @@ select * from nabu.workspace_pipeline where workspace_pipeline_id = <input_data.
 >>
 
 fetch_job_schedule_details(input_data)::=<<
-SELECT job_schedule_id,jsd.cru_by
-FROM nabu.job_schedule_details jsd
+SELECT job_schedule_id,cru_by
+FROM nabu.job_schedule_details
 WHERE data_movement_id = <input_data.data_movement_id>
-AND valid_to_ts = '9999-12-31';
+AND valid_to_ts = '9999-12-31 00:00:00.000';
 >>
 
 get_spark_configs(input_data)::=<<
